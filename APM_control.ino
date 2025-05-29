@@ -33,7 +33,7 @@ AP_InertialSensor_MPU6000 ins;
 //==========================================//
 Vector3f gyro, accel;
 float roll, pitch, yaw;
-float roll_error, pitch_error, yaw_rate_error;
+float roll_error, pitch_error;
 
 float roll_cmd, pitch_cmd, yaw_rate_cmd, thro_cmd;
 float roll_out, pitch_out, yaw_out, thro_out;
@@ -52,18 +52,18 @@ float print_interval;
 //===========================================//
 //         USER-SPECIFIED VARIABLES          //
 //===========================================//
-float maxThro = 1;        //limit throttle from 0% to 100%
-float maxRoll = 30.0;     //[deg]
-float maxPitch = 30.0;    //[deg]
-float maxYaw_rate = 10.0; //[deg/s]
+float maxThro = 1;        //
+float maxRoll = 20.0;     //[deg]
+float maxPitch = 20.0;    //[deg]
+float maxYaw_rate = 3.0; //[deg/s]
 
 float alpha = 0.2; //Low pass filter gain value
 float roll_KP = 0.009;
 float roll_KD = 0.001;
 float pitch_KP = 0.009;
-float pitch_KD = 0.001;
-float yaw_KP = 0.009;
-float yaw_KD = 0.001;
+float pitch_KD = 0.0001;
+float yaw_rate_KP = 0.006;
+float yaw_rate_KD = 0.001;
 
 //Set radio channels to default failsafe values in the event
 //that bad reciever data is detected. Recommended defaults:
@@ -74,6 +74,7 @@ uint16_t RC_throttle_fs = 1000;
 uint16_t RC_yaw_fs = 1500;
 
 bool is_armed = false;
+bool is_shutdowned = false;
 
 namespace print{
  void PWM_RC();
@@ -172,7 +173,7 @@ namespace print{
     hal.console -> printf("Attitude [deg] : ");
     hal.console -> printf("roll : %.2f\t", roll);
     hal.console -> printf("pitch : %.2f\t", pitch);
-    hal.console -> printf("yaw_rate : %.2f\t", yaw_out);
+    hal.console -> printf("yaw_rate : %.2f\t", yaw_rate_cmd);
     hal.console -> printf("yaw : %.2f\t", yaw);
     hal.console -> print("\n");
   }
@@ -200,10 +201,20 @@ void get_Cmd(){
   yaw_rate_cmd = constrain(yaw_rate_cmd, -1.0, 1.0)*maxYaw_rate;
   
   if (RC_pwm[6] < 1500){
-    is_armed = true;
+    if(is_shutdowned == false){
+      is_armed = true;
+    }
+    else{
+      if(RC_pwm[2] < 1050){
+        is_armed = true;
+        is_shutdowned = false;
+      }
+    }
   }
   else{
+    //engine killed
     is_armed = false;
+    is_shutdowned = true;
   }
 }
 
@@ -229,19 +240,18 @@ void control_Law(){
   roll_out = constrain(roll_out, -0.3, 0.3);
   
   pitch_error = pitch_cmd - pitch;
-  pitch_out = pitch_error * pitch_KP - gyro.y*pitch_KD;
+  pitch_out = pitch_error * pitch_KP - gyro.y*roll_KD;
   pitch_out = constrain(pitch_out, -0.3, 0.3);
   
-  yaw_rate_error = yaw_rate_cmd - gyro.z;
-  yaw_out = yaw_rate_error * yaw_KP - gyro.z * yaw_KD;
-  yaw_out = constrain(yaw_out, -0.1, 0.1);
+  yaw_out = (yaw_rate_cmd-gyro.z)*yaw_rate_KP - gyro.z *yaw_rate_KD; 
+  yaw_out = constrain(yaw_rate_cmd, -0.1, 0.1);
 }
 
 void control_Mixer(){
   m1_scaled = thro_out + pitch_out - yaw_out;
-  m2_scaled = thro_out - roll_out + yaw_out;
+  m2_scaled = thro_out - roll_out  + yaw_out;
   m3_scaled = thro_out - pitch_out - yaw_out;
-  m4_scaled = thro_out + roll_out + yaw_out;
+  m4_scaled = thro_out + roll_out  + yaw_out;
   
   m1_scaled = constrain(m1_scaled, 0.0, 1.0);
   m2_scaled = constrain(m2_scaled, 0.0, 1.0); 
@@ -294,7 +304,7 @@ void set_dmp(){
 }
 
 void engine_Kill(){
-  if(!is_armed){
+  if(is_armed == false){
     Motor_pwm[0] = 1000;
     Motor_pwm[1] = 1000;
     Motor_pwm[2] = 1000;
@@ -307,7 +317,9 @@ void arm_Motors(){
   if (RC_pwm[2] >1100){
     hal.console -> print("Arming denied : Throttle not at minimum.");
     while(true){}
+  
   }
+  
   
   for(int i = 0; i<= 500; i++){
     hal.rcout -> write(Motor_1, 1000);
