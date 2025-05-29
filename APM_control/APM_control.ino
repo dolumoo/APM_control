@@ -58,10 +58,10 @@ float maxPitch = 20.0;    //[deg]
 float maxYaw_rate = 3.0; //[deg/s]
 
 float alpha = 0.2; //Low pass filter gain value
-float roll_KP = 0.009;
-float roll_KD = 0.001;
-float pitch_KP = 0.009;
-float pitch_KD = 0.0001;
+float roll_KP = 0.006;
+float roll_KD = 0.002;
+float pitch_KP = 0.006;
+float pitch_KD = 0.003;
 float yaw_rate_KP = 0.006;
 float yaw_rate_KD = 0.001;
 
@@ -183,10 +183,12 @@ namespace print{
 //               FUNCTIONS                  //
 //==========================================//
 void get_Cmd(){
+  /*
   for(int i = 0; i<4; i++){
     RC_pwm[i] = (1-alpha)*RC_pwm_prev[i] + alpha*RC_pwm[i];
     RC_pwm_prev[i] = RC_pwm[i];
   }
+  */
   
   fail_Safe();
    
@@ -243,8 +245,11 @@ void control_Law(){
   pitch_out = pitch_error * pitch_KP - gyro.y*roll_KD;
   pitch_out = constrain(pitch_out, -0.3, 0.3);
   
+  
+  /*
   yaw_out = (yaw_rate_cmd-gyro.z)*yaw_rate_KP - gyro.z *yaw_rate_KD; 
   yaw_out = constrain(yaw_rate_cmd, -0.1, 0.1);
+  */
 }
 
 void control_Mixer(){
