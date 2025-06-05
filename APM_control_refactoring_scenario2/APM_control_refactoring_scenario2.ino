@@ -9,17 +9,14 @@
 #include <AP_HAL_AVR.h>       
 #include <AP_ADC.h>
 #include <AP_InertialSensor.h>
-
 //===========================================//
 //          HARDWARE DECLARATION             //
 //===========================================//
 const AP_HAL::HAL& hal = AP_HAL_AVR_APM2; 
 AP_InertialSensor_MPU6000 ins;
-
 //===========================================//
 //      USER-SPECIFIED DEFINES GLOBAL        //  
 //===========================================//
-//change this to match the number of transmitter channels you have
 #define num_RC_channels 8
 #define num_Motor 4
 
@@ -28,17 +25,31 @@ AP_InertialSensor_MPU6000 ins;
 #define Motor_3 2 //Num 3 motor
 #define Motor_4 3 //Num 4 motor
 
+#define roll  0
+#define pitch 1
+#define thro  2
+#define yaw   3
+
 //==========================================//
 //     GLOBAL VARIABLES DECLARATION         //
 //==========================================//
 Vector3f gyro, accel;
-float roll, pitch, yaw;
-float roll_error, pitch_error;
-float time = 0;
+float attitude[4];
+float gyro_Val[4];
 
-float roll_cmd, pitch_cmd, yaw_rate_cmd, thro_cmd;
-float roll_out, pitch_out, yaw_out, thro_out;
-float m1_scaled, m2_scaled, m3_scaled, m4_scaled;
+float error[4];
+
+// command
+float cmd[4];
+float cmd_Mval[4] = {1500, 1500, 1000, 1500}; // minus value
+float cmd_Dval[4] = {500, 500, 1000, 500};    // divide value
+float cmd_Cmin[4] = {-1.0, -1.0, 0, -1.0};    // constrain value
+
+// motor out
+float out[4];
+float scaled[4];
+
+// low pass filter
 float dt;
 uint32_t current_time, prev_time;
 
@@ -53,29 +64,31 @@ float print_interval;
 //===========================================//
 //         USER-SPECIFIED VARIABLES          //
 //===========================================//
-float maxThro = 1;        //
-float maxRoll = 20.0;     //[deg]
-float maxPitch = 20.0;    //[deg]
-float maxYaw_rate = 3.0; //[deg/s]
-
+// control value
+float maxVal[4] = {20, 20, 1, 3};
 float alpha = 0.2; //Low pass filter gain value
-float roll_KP = 0.006;
-float roll_KD = 0.002;
-float pitch_KP = 0.006;
-float pitch_KD = 0.003;
-float yaw_rate_KP = 0.006;
-float yaw_rate_KD = 0.001;
+float KP[4] = {0.006, 0.006, 0, 0};
+float KD[4] = {0.002, 0.004, 0, 0};
 
-//Set radio channels to default failsafe values in the event
-//that bad reciever data is detected. Recommended defaults:
+float Kp_roll_angle = 3.5f;
+float Kp_roll_rate = 0.0012f;
+float Ki_roll_rate = 0.0001f;
+float Kp_pitch_angle = 3.5f;
+float Kp_pitch_rate = 0.0012f;
+float Ki_pitch_rate = 0.0001f;
+float Kp_yaw_rate = 0.0025f;
+float Kd_yaw_rate = 0.000001f;
+float Ki_yaw_rate = 0.003f;
 
-uint16_t RC_roll_fs = 1500;
-uint16_t RC_pitch_fs = 1500;
-uint16_t RC_throttle_fs = 1000;
-uint16_t RC_yaw_fs = 1500;
+// failsafe value
+uint16_t fs[4] = {1500, 1500, 1000, 1500};
 
+// scenario 1
 bool is_armed = false;
 bool is_shutdowned = false;
+
+//
+float time = 0;
 
 namespace print{
  void PWM_RC();
@@ -83,7 +96,7 @@ namespace print{
  void newline();
  void print_accel(Vector3f accel);
  void print_gyro(Vector3f gyro);
- void print_att(float roll, float pitch, float yaw);
+ void print_att(float _roll, float _pitch, float _yaw);
 }
 
 //===========================================//
@@ -92,12 +105,11 @@ namespace print{
 void setup(){
   ins.init(AP_InertialSensor::COLD_START, AP_InertialSensor::RATE_100HZ, NULL);
   ins.init_accel(NULL);
-  set_dmp();
-  
+  set_dmp();  
   hal.rcout -> set_freq(0xF, 490);
   hal.rcout -> enable_mask(0xFF);
+  arm_Motors();
 }
-
 //===========================================//
 //               VOID LOOP                   //
 //===========================================//
@@ -115,28 +127,24 @@ void loop(){
   control_Law();
   control_Mixer();
   motors_Out();
-
-  hal.rcout -> write(Motor_1, Motor_pwm[0]);  
-  hal.rcout -> write(Motor_2, Motor_pwm[1]);  
-  hal.rcout -> write(Motor_3, Motor_pwm[2]);
-  hal.rcout -> write(Motor_4, Motor_pwm[3]);  
+  
+  for(int i = 0; i < 4; i++){
+    hal.rcout -> write(i, Motor_pwm[i]);
+  }
 }
 
 //===========================================//
 //                NAMESPACE                  //
 //===========================================//
-
 namespace print{
   void PWM_RC(){
     hal.console -> printf("RC3_pwm : %.2f\n", float(RC_pwm[2]));
     hal.console -> print("\n"); 
   }
   void PWM_Motor(){  
-    hal.console -> printf("Motor1_pwm : %.2f\t", float(Motor_pwm[0])); 
-    hal.console -> printf("Motor2_pwm : %.2f\t", float(Motor_pwm[1]));  
-    hal.console -> printf("Motor3_pwm : %.2f\n", float(Motor_pwm[2]));
-    hal.console -> printf("Motor4_pwm : %.2f\t", float(Motor_pwm[3])); 
-    hal.console -> print("\n"); 
+    for(int i = 0; i < 4; i++){
+      hal.console -> printf("Motor%n_pwm : %.2f\n", i, float(Motor_pwm[i]));
+    } 
   }
   void newline(){
     hal.console -> print("\n");
@@ -158,12 +166,11 @@ namespace print{
     hal.console -> print("\n");
   }
   
-  void print_att(float roll, float pitch, float yaw){
+  void print_att(float _roll, float _pitch, float _yaw){
     hal.console -> printf("Attitude [deg] : ");
-    hal.console -> printf("roll : %.2f\t", roll);
-    hal.console -> printf("pitch : %.2f\t", pitch);
-    hal.console -> printf("yaw_rate : %.2f\t", yaw_rate_cmd);
-    hal.console -> printf("yaw : %.2f\t", yaw);
+    hal.console -> printf("roll : %.2f\t", _roll);
+    hal.console -> printf("pitch : %.2f\t", _pitch);
+    hal.console -> printf("yaw : %.2f\t", _yaw);
     hal.console -> print("\n");
   }
 }
@@ -176,8 +183,8 @@ void scenario(){
   int PITCH = 15;
   int YAW = 1;
   
-
-  
+  float roll_cmd, pitch_cmd, yaw_rate_cmd;
+ 
   if (time < 5)
   {roll_cmd = 0;   pitch_cmd = 0;   yaw_rate_cmd = 0;}
   else if (time > 5 && time < 10)
@@ -208,24 +215,29 @@ void scenario(){
    hal.console -> printf("%.3f  \t%.f  \t%.4f  \t%.f  \t%.4f  \t%.f  \t%.4f\n", time, roll_cmd, roll, pitch_cmd, pitch, yaw_rate_cmd, gyro.z);
   }
   time += dt;
-
+  
+    
+  cmd[roll] = roll_cmd;
+  cmd[pitch] = pitch_cmd;
+  cmd[yaw] = yaw_rate_cmd;
 }
 
 void get_Cmd(){
+  /*
   for(int i = 0; i<4; i++){
     RC_pwm[i] = (1-alpha)*RC_pwm_prev[i] + alpha*RC_pwm[i];
     RC_pwm_prev[i] = RC_pwm[i];
   }
+  */
   
   fail_Safe();
   
-  thro_cmd = (RC_pwm[2] - 1000.0)/1000.0;
+  cmd[thro] = (RC_pwm[2] - 1000.0)/1000.0;
   scenario();
   
-  thro_cmd = constrain(thro_cmd, 0.0, 1.0)*maxThro; 
-  roll_cmd = constrain(roll_cmd, -1.0, 1.0)*maxRoll; 
-  pitch_cmd = constrain(pitch_cmd, -1.0, 1.0)*maxPitch;
-  yaw_rate_cmd = constrain(yaw_rate_cmd, -1.0, 1.0)*maxYaw_rate;
+  for (int i = 0; i < 4; i++){
+    cmd[i] = constrain(cmd[i], cmd_Cmin[i], 1) * maxVal[i];
+  }
   
   if (RC_pwm[6] < 1500){
     if(is_shutdowned == false){
@@ -239,62 +251,118 @@ void get_Cmd(){
     }
   }
   else{
-    //engine killed
     is_armed = false;
     is_shutdowned = true;
   }
 }
 
 void fail_Safe(){
-  float minVal = 950;
-  float maxVal = 2200;
-  
-  if(RC_pwm[2] > maxVal || RC_pwm[2] < minVal){
-    
-    RC_pwm[0] = RC_roll_fs;
-    RC_pwm[1] = RC_pitch_fs;
-    RC_pwm[2] = RC_throttle_fs;
-    RC_pwm[3] = RC_yaw_fs;
+  if(RC_pwm[thro] > 2200 || RC_pwm[thro] < 950){
+    for(int i = 0; i < 4; i++){
+      RC_pwm[i] = fs[i];
+    }
   }
 }
 
-void control_Law(){
-  thro_out = thro_cmd;
-  
-  //roll controller
-  roll_error = roll_cmd - roll;
-  roll_out = roll_error * roll_KP - gyro.x*roll_KD;
-  roll_out = constrain(roll_out, -0.3, 0.3);
-  
-  pitch_error = pitch_cmd - pitch;
-  pitch_out = pitch_error * pitch_KP - gyro.y*pitch_KD;
-  pitch_out = constrain(pitch_out, -0.3, 0.3);
-  
-  yaw_out = 0;
-  /*
-  yaw_out = (yaw_rate_cmd-gyro.z)*yaw_rate_KP - gyro.z *yaw_rate_KD; 
-  yaw_out = constrain(yaw_rate_cmd, -0.1, 0.1);
-  */
+float control_PID(int i){
+  error[i] = cmd[i] - attitude[i];
+  out[i] = error[i] * KP[i] - gyro_Val[i] * KD[i];
+  return out[i];
 }
 
-void control_Mixer(){
-  m1_scaled = thro_out + pitch_out - yaw_out;
-  m2_scaled = thro_out - roll_out  + yaw_out;
-  m3_scaled = thro_out - pitch_out - yaw_out;
-  m4_scaled = thro_out + roll_out  + yaw_out;
+/*
+void control_Law(){
+  out[thro]  = cmd[thro];
+  out[roll]  = control_PID(roll);
+  out[pitch] = control_PID(pitch);
+  // out[yaw] =
   
-  m1_scaled = constrain(m1_scaled, 0.0, 1.0);
-  m2_scaled = constrain(m2_scaled, 0.0, 1.0); 
-  m3_scaled = constrain(m3_scaled, 0.0, 1.0);
-  m4_scaled = constrain(m4_scaled, 0.0, 1.0); 
+  yaw_out = (yaw_rate_cmd-gyro.z)*yaw_rate_KP - gyro.z *yaw_rate_KD; 
+  yaw_out = constrain(yaw_rate_cmd, -0.1, 0.1);
+}
+*/
+
+void control_Law(){
+  out[thro] = cmd[thro];
+  
+  //roll controller
+  float roll_error, pitch_error, yaw_error;
+  float yaw_error_derive, prev_yaw_error, yaw_int;
+  static float roll_rate_d = 0.f;
+  static float roll_rate_error = 0.f;
+  static float roll_rate_error_i = 0.f;
+  
+  roll_error = cmd[roll] - attitude[roll];
+  roll_rate_d = roll_error * Kp_roll_angle;
+  roll_rate_error = roll_rate_d - gyro.x;
+  roll_rate_error_i += roll_rate_error*dt;
+  
+  if(out[thro] < 0.1){
+    roll_rate_error_i = 0;
+  }
+  
+  roll_rate_error_i = constrain(roll_rate_error_i, -20, 20);
+  out[roll] =  Kp_roll_rate * roll_rate_error + Ki_roll_rate * roll_rate_error_i;
+  out[roll] = constrain(out[roll], -0.2, 0.2);
+  
+  //pitch controller
+  static float pitch_rate_d = 0.f;
+  static float pitch_rate_error = 0.f;
+  static float pitch_rate_error_i = 0.f;
+  
+  pitch_error = cmd[pitch] - attitude[pitch];
+  pitch_rate_d = pitch_error * Kp_pitch_angle;
+  pitch_rate_error = pitch_rate_d - gyro.y;
+  pitch_rate_error_i += pitch_rate_error*dt;
+  
+  if(out[thro] < 0.1){
+    pitch_rate_error_i = 0;
+  }
+  
+  pitch_rate_error_i = constrain(pitch_rate_error_i, -20, 20);
+  out[pitch] =  Kp_pitch_rate * pitch_rate_error + Ki_pitch_rate * pitch_rate_error_i;
+  out[pitch] = constrain(out[pitch], -0.2, 0.2);
+  
+  //yaw rate controller
+  yaw_error = 2 * cmd[yaw] - gyro.z;
+  yaw_error_derive = (yaw_error - prev_yaw_error)/ dt;
+  prev_yaw_error = yaw_error;
+  yaw_int += yaw_error * dt;
+  
+  if(out[thro] < 0.1){
+    yaw_int = 0;
+  }
+  
+  yaw_int = constrain(yaw_int, -10, 10);
+  out[yaw] = yaw_error * Kp_yaw_rate + yaw_int * Ki_yaw_rate + yaw_error_derive * Kd_yaw_rate; 
+  out[yaw] = constrain(out[yaw], -0.1, 0.1);
+}
+
+
+void control_Mixer(){
+  for(int i = 0; i < 4; i++){
+    int m = i % 2; 
+    int n = (i+1) % 2;
+    int p = (i == 1 ? -1 : 1);
+    int q = (i == 2 ? -1 : 1);
+        
+    scaled[i] = out[thro] + p * m * out[roll] + q * n * out[pitch] ;//+ out[yaw];
+    scaled[i] = constrain(scaled[i], 0.0, 1.0);
+  }
+  
+  /*
+  m1_scaled = thro_out + roll_out *  0 + pitch_out *  1 + yaw_out * -1;  0
+  m2_scaled = thro_out + roll_out * -1 + pitch_out *  0 + yaw_out *  1;  1
+  m3_scaled = thro_out + roll_out *  0 + pitch_out * -1 + yaw_out * -1;  2
+  m4_scaled = thro_out + roll_out *  1 + pitch_out *  0 + yaw_out *  1;  3
+  */
 }
 
 void motors_Out(){
   //  % -> PWM
-  Motor_pwm[0] = 1000 + 1000 * m1_scaled;
-  Motor_pwm[1] = 1000 + 1000 * m2_scaled;
-  Motor_pwm[2] = 1000 + 1000 * m3_scaled;
-  Motor_pwm[3] = 1000 + 1000 * m4_scaled;
+  for(int i = 0; i < 4; i++){
+    Motor_pwm[i] = 1000 + 1000 * scaled[i];
+  }
   
   // safety
   if(RC_pwm[2] < 1050){ 
@@ -311,15 +379,15 @@ void get_IMU_data(){
   
   gyro = ins.get_gyro();
   accel = ins.get_accel();
-  ins.quaternion.to_euler(&roll, &pitch, &yaw);
+  ins.quaternion.to_euler(&attitude[roll], &attitude[pitch], &attitude[yaw]);
  
-  gyro.x = ToDeg(gyro.x);
-  gyro.y = ToDeg(gyro.y);
-  gyro.z = ToDeg(gyro.z);
+  gyro_Val[0] = ToDeg(gyro.x);
+  gyro_Val[1] = ToDeg(gyro.y);
+  gyro_Val[3]= ToDeg(gyro.z);
   
-  roll = ToDeg(roll);
-  pitch = ToDeg(pitch);
-  yaw = ToDeg(yaw);
+  attitude[roll] = ToDeg(attitude[roll]);
+  attitude[pitch] = ToDeg(attitude[pitch]);
+  attitude[yaw] = ToDeg(attitude[yaw]);
 }
 
 void set_dmp(){
@@ -347,9 +415,8 @@ void arm_Motors(){
   if (RC_pwm[2] >1100){
     hal.console -> print("Arming denied : Throttle not at minimum.");
     while(true){}
-  
+
   }
-  
   
   for(int i = 0; i<= 500; i++){
     hal.rcout -> write(Motor_1, 1000);
